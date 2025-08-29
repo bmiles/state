@@ -219,25 +219,80 @@ def run_tx_train(cfg: DictConfig):
 
     logger.info("Loggers and callbacks set up.")
 
-    if cfg["model"]["name"].lower().startswith("scgpt"):
-        plugins = [
-            MixedPrecision(
-                precision="bf16-mixed",
-                device="cuda",
-            )
-        ]
-    else:
-        plugins = []
+    # Honor optional Hydra overrides for trainer settings
+    # Map legacy `trainer.*` overrides to `training.*` if provided
+    trainer_overrides = cfg.get("trainer", {}) if isinstance(cfg, dict) else {}
+    if isinstance(trainer_overrides, dict):
+        for k in ("accelerator", "devices", "strategy", "precision"):
+            if k in trainer_overrides:
+                cfg["training"][k] = trainer_overrides[k]
 
-    if torch.cuda.is_available():
+    # Determine accelerator/devices/strategy/precision from config
+    requested_accelerator = str(cfg["training"].get("accelerator", "auto")).lower()
+    devices = cfg["training"].get("devices", 1)
+    strategy = cfg["training"].get("strategy", "auto")
+    precision_cfg = cfg["training"].get("precision", None)
+
+    # Normalize precision values
+    def _normalize_precision(p):
+        if p is None:
+            return None
+        if isinstance(p, int):
+            return "16-mixed" if p == 16 else ("bf16-mixed" if p == 16.0 else str(p))
+        ps = str(p).lower()
+        if ps in ("16", "fp16"):
+            return "16-mixed"
+        if ps in ("bf16", "bfloat16"):
+            return "bf16-mixed"
+        return p
+
+    precision = _normalize_precision(precision_cfg)
+
+    # Build plugins: keep bf16 plugin for scGPT only if user did not specify precision
+    plugins = []
+    if precision is None and cfg["model"]["name"].lower().startswith("scgpt"):
+        plugins = [MixedPrecision(precision="bf16-mixed", device="cuda")]
+
+    # Resolve accelerator
+    accelerator = None
+    if requested_accelerator in ("auto", None):
+        accelerator = "gpu" if torch.cuda.is_available() else "cpu"
+    elif requested_accelerator in ("gpu", "cuda"):
+        if not torch.cuda.is_available():
+            raise RuntimeError(
+                "Requested GPU accelerator but torch.cuda.is_available() is False. "
+                "Install a CUDA-enabled PyTorch, ensure drivers are present, and set CUDA_VISIBLE_DEVICES."
+            )
         accelerator = "gpu"
-    else:
+    elif requested_accelerator == "cpu":
         accelerator = "cpu"
+    elif requested_accelerator == "mps":
+        try:
+            mps_ok = getattr(torch.backends, "mps", None) and torch.backends.mps.is_available()
+        except Exception:
+            mps_ok = False
+        if not mps_ok:
+            raise RuntimeError("Requested MPS accelerator but torch.backends.mps.is_available() is False.")
+        accelerator = "mps"
+    else:
+        # Pass-through for other Lightning-supported strings
+        accelerator = requested_accelerator
+
+    # Validate device count for GPU
+    if accelerator == "gpu":
+        try:
+            n_gpus = torch.cuda.device_count()
+        except Exception:
+            n_gpus = 0
+        # Only validate if devices is an int
+        if isinstance(devices, int) and devices > n_gpus:
+            raise RuntimeError(f"Requested devices={devices} but only {n_gpus} CUDA devices visible.")
 
     # Decide on trainer params
     trainer_kwargs = dict(
         accelerator=accelerator,
-        devices=1,
+        devices=devices,
+        strategy=strategy,
         max_steps=cfg["training"]["max_steps"],  # for normal models
         check_val_every_n_epoch=None,
         val_check_interval=cfg["training"]["val_freq"],
@@ -246,6 +301,8 @@ def run_tx_train(cfg: DictConfig):
         callbacks=callbacks,
         gradient_clip_val=cfg["training"]["gradient_clip_val"] if cfg["model"]["name"].lower() != "cpa" else None,
     )
+    if precision is not None:
+        trainer_kwargs["precision"] = precision
 
     # Align logging cadence with rolling MFU window (and W&B logging)
     if "log_every_n_steps" in cfg["training"]:
@@ -282,7 +339,12 @@ def run_tx_train(cfg: DictConfig):
 
     # if a checkpoint does not exist, start with the provided checkpoint
     # this is mainly used for pretrain -> finetune workflows
+    # Support either model.kwargs.init_from or top-level checkpoint_path for warm-start
     manual_init = cfg["model"]["kwargs"].get("init_from", None)
+    if manual_init is None:
+        alias_ckpt = cfg.get("checkpoint_path") if isinstance(cfg, dict) else None
+        if alias_ckpt:
+            manual_init = alias_ckpt
     if checkpoint_path is None and manual_init is not None:
         print(f"Loading manual checkpoint from {manual_init}")
         checkpoint_path = manual_init
